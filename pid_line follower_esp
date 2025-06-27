@@ -1,0 +1,146 @@
+#include <L298N.h>
+#include <QTRSensors.h>
+
+// --- 1. PIN DEFINITIONS (ESP32) ---
+// Update these pins to match your robot's wiring.
+// These are standard GPIO numbers for an ESP32 board.
+
+// Motor A (e.g., Left Motor)
+#define PWMA 23
+#define AIN1 21
+#define AIN2 22
+
+// Motor B (e.g., Right Motor)
+#define PWMB 32
+#define BIN1 25
+#define BIN2 33
+
+// Standby Pin for the L298N Driver
+#define STBY 19
+
+// --- 2. PID TUNING CONSTANTS ---
+// These values will need to be tuned for your specific robot.
+// Start with these values and follow the tuning guide in the README.
+float Kp = 0.08;
+float Ki = 0.0001;
+float Kd = 1.0;
+
+// --- 3. ROBOT SPEED ---
+// This is the base speed of the robot. 200 is a good starting point.
+// The maximum value is 255.
+int lfspeed = 200;
+
+
+// --- Library and Global Variable Initialization ---
+L298N motor1(PWMA, AIN1, AIN2, STBY);
+L298N motor2(PWMB, BIN1, BIN2, STBY);
+
+QTRSensors qtr;
+
+const uint8_t SensorCount = 5;
+uint16_t sensorValues;
+
+uint16_t position;
+int P, D, I, previousError, error;
+int lsp, rsp;
+
+
+void setup() {
+  // Configure the QTR sensors for 5 analog sensors
+  qtr.setTypeAnalog();
+  // NOTE: Ensure these GPIO pins support ADC on your ESP32 model
+  qtr.setSensorPins((const uint8_t){26, 27, 14, 12, 13}, SensorCount);
+
+  delay(500);
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  // --- Sensor Calibration ---
+  // This process is crucial for accurate line reading.
+  digitalWrite(LED_BUILTIN, HIGH); // Turn on the built-in LED to indicate calibration mode
+  for (uint16_t i = 0; i < 400; i++) {
+    qtr.calibrate();
+  }
+  digitalWrite(LED_BUILTIN, LOW); // Turn off the LED when calibration is complete
+
+  // Optional: Print calibration values to Serial Monitor for debugging
+  Serial.begin(115200);
+  Serial.println("--- Calibration Complete ---");
+
+  delay(1000); // Wait a second before starting
+}
+
+void loop() {
+  // The main loop continuously calls the robot control function.
+  robot_control();
+}
+
+void robot_control() {
+  // Read the sensor values and get a single position value from 0 to 4000
+  // 0 = far left, 2000 = center, 4000 = far right
+  position = qtr.readLineBlack(sensorValues);
+
+  // Calculate the error from the center (setpoint is 2000 for a 5-sensor array)
+  error = position - 2000;
+
+  // --- Line Loss Logic ---
+  // This checks if all sensors are off the line (reading a high value for white).
+  // The threshold of 980 may need adjustment based on your calibration.
+  if (sensorValues >= 980 && sensorValues[1] >= 980 && sensorValues[2] >= 980 && sensorValues[3] >= 980 && sensorValues[4] >= 980) {
+    if (previousError > 0) { // If it was last seen to the right of center
+      motor_drive(230, -230); // Turn hard right to find it
+    } else { // If it was last seen to the left of center
+      motor_drive(-230, 230); // Turn hard left to find it
+    }
+    // Skip the PID calculation for this loop iteration to continue searching
+    return;
+  }
+
+  PID_Linefollow(error);
+}
+
+void PID_Linefollow(int error) {
+  // Calculate the three PID components
+  P = error;
+  I = I + error;
+  D = error - previousError;
+
+  // Calculate the total PID correction value
+  // The constants Kp, Ki, and Kd determine the weight of each component.
+  float PIDvalue = (Kp * P) + (Ki * I) + (Kd * D);
+  
+  // Remember the last error for the next D calculation
+  previousError = error;
+
+  // Calculate the speed for each motor by applying the correction
+  lsp = lfspeed - PIDvalue;
+  rsp = lfspeed + PIDvalue;
+
+  // Constrain motor speeds to the valid PWM range (-255 to 255)
+  if (lsp > 255) { lsp = 255; }
+  if (lsp < -255) { lsp = -255; }
+  if (rsp > 255) { rsp = 255; }
+  if (rsp < -255) { rsp = -255; }
+
+  // Send the final speed commands to the motors
+  motor_drive(lsp, rsp);
+}
+
+void motor_drive(int left, int right) {
+  // Control the left motor (motor1)
+  if (left > 0) {
+    motor1.setSpeed(left);
+    motor1.forward();
+  } else {
+    motor1.setSpeed(abs(left)); // Use absolute value for speed
+    motor1.backward();
+  }
+
+  // Control the right motor (motor2)
+  if (right > 0) {
+    motor2.setSpeed(right);
+    motor2.forward();
+  } else {
+    motor2.setSpeed(abs(right)); // Use absolute value for speed
+    motor2.backward();
+  }
+}
