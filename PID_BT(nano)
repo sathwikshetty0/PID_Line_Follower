@@ -1,0 +1,224 @@
+#include <QTRSensors.h>
+#include <SoftwareSerial.h>
+
+// --- Pin Definitions ---
+
+// Motor A (Left Motor)
+const int ENA = 9;  // PWM Speed Control Pin for Motor A (must be a PWM pin)
+const int IN1 = 8;
+const int IN2 = 7;
+
+// Motor B (Right Motor)
+const int ENB = 10; // PWM Speed Control Pin for Motor B (must be a PWM pin)
+const int IN3 = 12;
+const int IN4 = 11;
+
+// Bluetooth Module (HC-05/HC-06)
+// Using SoftwareSerial to create a virtual serial port
+// Connect the RX pin of the Bluetooth module to Arduino pin 2
+// Connect the TX pin of the Bluetooth module to Arduino pin 3
+SoftwareSerial bluetooth(2, 3); // RX, TX
+
+// --- Sensor Setup ---
+QTRSensors qtr;
+const uint8_t SensorCount = 5;
+uint16_t sensorValues[SensorCount];
+
+// --- PID Control Variables ---
+float Kp = 0.1; // Proportional gain
+float Ki = 0;   // Integral gain
+float Kd = 1;   // Derivative gain
+
+// Variables for receiving PID values via Bluetooth
+float receivedKp = Kp;
+float receivedKi = Ki;
+float receivedKd = Kd;
+uint8_t multiP = 1;
+uint8_t multiI = 1;
+uint8_t multiD = 1;
+
+// Main PID calculation variables
+int error;
+float P, I, D;
+float previousError = 0;
+float PIDvalue;
+
+// --- Motor Control Variables ---
+int lsp, rsp;
+int lfspeed = 150; // Base speed of the robot (0-255)
+
+// --- Robot State ---
+boolean onoff = false; // Robot is off by default
+
+// --- Bluetooth Communication Variables ---
+int val, cnt = 0, v[3];
+
+void setup() {
+  // --- Initialize Serial Communication ---
+  Serial.begin(9600);
+  bluetooth.begin(9600); // Default baud rate for HC-05/HC-06
+  Serial.println("Bluetooth Started! Ready to pair...");
+
+  // --- Configure Motor Pins ---
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  // --- Configure Sensor Pins ---
+  qtr.setTypeAnalog();
+  qtr.setSensorPins((const uint8_t[]){A0, A1, A2, A3, A4}, SensorCount);
+
+  // --- Sensor Calibration ---
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH); // Turn on built-in LED to indicate calibration mode
+
+  Serial.println("Calibrating sensors... Please slide the sensor array over the line for 10 seconds.");
+  for (uint16_t i = 0; i < 400; i++) {
+    qtr.calibrate();
+  }
+  digitalWrite(LED_BUILTIN, LOW); // Turn off LED to indicate calibration is complete
+  Serial.println("Calibration finished.");
+
+  // Print calibrated minimum values for debugging
+  for (uint8_t i = 0; i < SensorCount; i++) {
+    Serial.print(qtr.calibrationOn.minimum[i]);
+    Serial.print(' ');
+  }
+  Serial.println();
+
+  delay(1000);
+}
+
+void loop() {
+  // Check for incoming Bluetooth data
+  if (bluetooth.available()) {
+    while (bluetooth.available() == 0); // Wait for data
+    valuesread();
+    processing();
+  }
+
+  // Control the robot based on the 'onoff' state
+  if (onoff == true) {
+    robot_control();
+  } else {
+    motor_stop();
+  }
+}
+
+void robot_control() {
+  // Get the line position from the sensor array
+  position = qtr.readLineBlack(sensorValues);
+  error = 2000 - position; // The ideal position is 2000 for a 5-sensor array
+
+  // --- Line Loss Recovery ---
+  // If all sensors are on a white surface (reading low values)
+  if (sensorValues[0] < 200 && sensorValues[1] < 200 && sensorValues[2] < 200 && sensorValues[3] < 200 && sensorValues[4] < 200) {
+    if (previousError > 0) { // If the robot was last seen to the left of the line
+      motor_drive(-200, 200); // Turn hard left to find the line
+    } else { // If the robot was last seen to the right of the line
+      motor_drive(200, -200); // Turn hard right to find the line
+    }
+    return; // Skip PID calculation for this loop
+  }
+
+  PID_Linefollow(error);
+}
+
+void PID_Linefollow(int error) {
+  // Calculate the P, I, and D terms
+  P = error;
+  I = I + error;
+  D = error - previousError;
+
+  // Calculate the final PID value using the gains
+  PIDvalue = (Kp * P) + (Ki * I) + (Kd * D);
+  previousError = error;
+
+  // Calculate the speed for each motor based on the PID correction
+  lsp = lfspeed - PIDvalue;
+  rsp = lfspeed + PIDvalue;
+
+  // Constrain motor speeds to be within the valid PWM range (-255 to 255)
+  lsp = constrain(lsp, -255, 255);
+  rsp = constrain(rsp, -255, 255);
+
+  motor_drive(lsp, rsp);
+}
+
+// Reads and processes incoming Bluetooth data
+void valuesread() {
+  val = bluetooth.read();
+  cnt++;
+  v[cnt] = val;
+  if (cnt == 2) {
+    cnt = 0;
+  }
+}
+
+// Assigns the received Bluetooth values to the appropriate variables
+void processing() {
+  int a = v[1];
+  if (a == 1) {
+    receivedKp = v[2];
+    Kp = receivedKp / pow(10, multiP);
+  }
+  if (a == 2) {
+    multiP = v[2];
+    Kp = receivedKp / pow(10, multiP);
+  }
+  if (a == 3) {
+    receivedKi = v[2];
+    Ki = receivedKi / pow(10, multiI);
+  }
+  if (a == 4) {
+    multiI = v[2];
+    Ki = receivedKi / pow(10, multiI);
+  }
+  if (a == 5) {
+    receivedKd = v[2];
+    Kd = receivedKd / pow(10, multiD);
+  }
+  if (a == 6) {
+    multiD = v[2];
+    Kd = receivedKd / pow(10, multiD);
+  }
+  if (a == 7) {
+    onoff = v[2];
+  }
+}
+
+// Controls the motors based on the calculated left and right speeds
+void motor_drive(int left, int right) {
+  // Control Right Motor
+  if (right > 0) {
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+  } else {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+  }
+  analogWrite(ENB, abs(right));
+
+  // Control Left Motor
+  if (left > 0) {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+  } else {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+  }
+  analogWrite(ENA, abs(left));
+}
+
+// Stops both motors
+void motor_stop() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
